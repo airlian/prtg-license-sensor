@@ -1,0 +1,212 @@
+# prtg-license-sensor.ps1 —— PRTG「EXE/Script Advanced」自訂感測器：把授權計量數變成**通道**長期記錄
+#
+# 為什麼要這樣做：計量數本來是「此刻快照」，而原廠計費口徑是「每個 UTC 日的最高小時級 active sensor 數」。
+# 變成通道之後：PRTG 每個輪詢間隔記一次 → 直接看曲線、查每日高峰、超過門檻自動告警。
+#
+# 計量口徑：計量數 = sensortree 全部 −（狀態碼 7（PausedbyUser）暫停 ∪ 狀態碼 11（PausedbyLicense） ∪ 建立未滿 N 小時），聯集不重複扣。
+#           額度：能解析 MaxSensorCount 才算得出來；F／C 直接用該值，S（訂閱制）÷ SubscriptionDivisor（預設 2）。
+#           解析不到就當上限未知（不猜），改由 -LicenseLimit 提供。
+#
+# 建立方式（摘要；完整步驟見 README.md / README.zh-TW.md）
+#   1) 本檔放到「執行探測器的那台機器」的 PRTG 程式安裝目錄下、給會回 XML/JSON 的資料夾：
+#        C:\Program Files (x86)\PRTG Network Monitor\Custom Sensors\EXEXML\
+#      （原廠：EXE/Script Advanced 用 Custom Sensors\EXEXML；Custom Sensors\EXE 是標準版用的。
+#        遠端探測器要放到探測器那台、集群則每個節點都要放）
+#   2) 新增感測器 → 類型 EXE/Script Advanced → 在 EXE/Script 欄選這支腳本（清單讀自 EXEXML，有快取延遲）
+#      解譯器留預設＝走 powershell.exe＝Windows PowerShell 5.1；腳本若未簽章，要放寬執行策略
+#   3) Parameters 例：-BaseUri http://127.0.0.1 -TokenFile "C:\ProgramData\prtg-license\token.txt"
+#      ⚠ 不要把 apitoken／passhash 寫進 Parameters —— 它會在感測器設定與 API 回應裡明文可見
+#   4) 間隔建議 ≥300 秒（本機 127.0.0.1 負載很低）；注意**這個感測器本身也算 1 顆 sensor**
+#
+# 輸出：PRTG 自訂感測器 XML。**stdout 只能出現這一份**，其餘訊息一律走 stderr（函式 Log）。
+#   <prtg><result><channel>..</channel><value>..</value><unit>Count</unit></result><text>..</text></prtg>
+# 失敗：輸出 <prtg><error>原因</error></prtg> 後 exit 0 → PRTG 將感測器標為 Down 並顯示原因。
+#
+# 通道名與 <text> 一律用 ASCII：感測器由 PRTG 服務帳號執行，主控台的 stdout 編碼在 Windows PowerShell
+# 5.1 上是 OEM 代碼頁，中文會變成亂碼進到歷史紀錄裡。
+param(
+    [string] $BaseUri = 'http://127.0.0.1',
+    [string] $ApiToken       = '',
+    [string] $TokenFile      = '',      # 檔內一行 apitoken（建議）
+    [string] $Username       = '',
+    [string] $Passhash       = '',
+    [string] $PasshashFile   = '',      # 檔內一行 username:passhash
+    [int]    $LicenseLimit   = 0,       # 實際額度；訂閱制填「顯示上限 ÷ 2」後的那個數
+    [int]    $SubscriptionDivisor = 2,
+    [double] $AgeHours       = 24,
+    [int]    $WarnPercent    = 80,
+    [int]    $ErrorPercent   = 100,
+    [int]    $TimeoutSec     = 30,
+    [switch] $NoAgeCheck,
+    [switch] $Limits,                   # 預設關：改在感測器的 Channel Limits 分頁設門檻（見下方說明）
+    [switch] $LogStderr
+)
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
+function Log([string]$m) { if ($LogStderr) { [Console]::Error.WriteLine($m) } }
+function Esc([string]$s) { [System.Security.SecurityElement]::Escape($s) }
+function Fail([string]$m) { [Console]::Out.WriteLine('<prtg><error>' + (Esc $m) + '</error></prtg>'); exit 0 }
+
+# ---------- 憑證 ----------
+if ($TokenFile -and (Test-Path $TokenFile)) { $ApiToken = (Get-Content $TokenFile -Raw).Trim() }
+if ($PasshashFile -and (Test-Path $PasshashFile)) {
+    $p = (Get-Content $PasshashFile -Raw).Trim(); $i = $p.IndexOf(':')
+    if ($i -lt 1) { Fail 'PasshashFile must contain one line: username:passhash' }
+    $Username = $p.Substring(0, $i); $Passhash = $p.Substring($i + 1)
+}
+if ($BaseUri -match '/api$') { $BaseUri = $BaseUri -replace '/api$', '' }
+$Base = $BaseUri.TrimEnd('/')
+# ⚠ 實測：PRTG 的 API 金鑰**不是純數字**，本站是 48 碼、可含 `=`（base64 風格）。
+#   只擋明顯壞值（空白、引號、&、%佔位符），不要拿「純數字」這種錯誤假設去擋客戶的金鑰。
+if ($ApiToken -and $ApiToken -notmatch '^[A-Za-z0-9+=/_-]{8,}$') { Fail 'apitoken looks invalid (8+ chars of [A-Za-z0-9+=/_-], no spaces/quotes/&)' }
+if (-not $ApiToken -and -not ($Username -and $Passhash)) { Fail 'no credentials: use -TokenFile (preferred) or -ApiToken / -Username + -Passhash' }
+$auth = if ($ApiToken) { @{ apitoken = $ApiToken } } else { @{ username = $Username; passhash = $Passhash } }
+$aq   = ($auth.GetEnumerator() | ForEach-Object { '{0}={1}' -f $_.Key, [uri]::EscapeDataString($_.Value) }) -join '&'
+$logoff = ('{0}/api/?{1}' -f $Base, (($auth.Keys | ForEach-Object { "$_=***" }) -join '&'))
+
+# ---------- HTTP ----------
+$certBypass = ($Base -notmatch '^https?://(127\.0\.0\.1|localhost)(:|/|$)')
+$PSMajor    = [int]$PSVersionTable.PSVersion.Major
+if ($PSMajor -lt 6) {
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    if ($certBypass) { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } }
+}
+function Get-Json {
+    param([string]$Path, [string]$ExtraQuery)
+    $url = '{0}/api/{1}?output=json&{2}&{3}' -f $Base, $Path, $ExtraQuery, $aq
+    $p = @{ Uri = $url; TimeoutSec = $TimeoutSec; UseBasicParsing = $true }
+    if ($certBypass -and $PSMajor -ge 6) { $p['SkipCertificateCheck'] = $true }
+    try { $r = Invoke-WebRequest @p } catch {
+        $ex = $_.Exception
+        $why = if ($ex.Message) { $ex.Message } elseif ($ex.InnerException) { $ex.InnerException.Message } else { 'no message' }
+        throw "$Path : $why"
+    }
+    $b = [string]$r.Content
+    if ($b -notmatch '^[\{\[]') { throw "$Path returned non-JSON (usually invalid credentials: this host answers HTTP 200 + HTML)" }
+    return ($b | ConvertFrom-Json)
+}
+function Get-XmlDoc {
+    param([string]$ExtraQuery)
+    $url = '{0}/api/table.xml?{1}&{2}' -f $Base, $ExtraQuery, $aq
+    $p = @{ Uri = $url; TimeoutSec = [math]::Max($TimeoutSec, 60); UseBasicParsing = $true }
+    if ($certBypass -and $PSMajor -ge 6) { $p['SkipCertificateCheck'] = $true }
+    $r = Invoke-WebRequest @p
+    $c = $r.Content
+    if ($c -is [xml]) { return $c }                 # 5.1 對 text/xml 直接給 XmlDocument（7 給字串）
+    $x = New-Object xml; $x.LoadXml([string]$c); return $x
+}
+function Get-Num {                                   # PRTG 用「點」小數 → 必須 InvariantCulture
+    param($Node, [string]$Name)
+    if ($null -eq $Node) { return 0.0 }
+    $n = $Node.SelectSingleNode($Name); if ($null -eq $n) { return 0.0 }
+    $d = 0.0
+    [void][double]::TryParse($n.InnerText, [System.Globalization.NumberStyles]::Float,
+                             [System.Globalization.CultureInfo]::InvariantCulture, [ref]$d)
+    return $d
+}
+function Get-Txt {
+    param($Node, [string]$Name)
+    if ($null -eq $Node) { return '' }
+    $n = $Node.SelectSingleNode($Name); if ($null -eq $n) { return '' }
+    return [string]$n.InnerText
+}
+
+try {
+    # ---------- 1) 一次 sensortree：數量＋逐碼＋暫停拆分＋「存在滿 N 小時」單邊界 ----------
+    $x = Get-XmlDoc -ExtraQuery 'content=sensortree&count=100000'
+    $nodes = $x.GetElementsByTagName('sensor')
+    if ($null -eq $nodes -or $nodes.Count -eq 0) { throw 'sensortree has no <sensor> nodes (credential cannot see anything?)' }
+    $epoch    = New-Object datetime(1899, 12, 30)
+    $cutoff   = [datetime]::UtcNow.AddHours(-$AgeHours)
+    $limitSec = $AgeHours * 3600.0
+    $byCode = @{ }; $c7 = 0; $c7direct = 0; $proven = 0; $susp = 0; $suspCounted = 0
+    foreach ($n in $nodes) {
+        $sc = 0; [void][int]::TryParse((Get-Txt $n 'status_raw'), [ref]$sc)
+        if ($byCode.ContainsKey([string]$sc)) { $byCode[[string]$sc] = $byCode[[string]$sc] + 1 } else { $byCode[[string]$sc] = 1 }
+        if ($sc -eq 7) { $c7++; if ((Get-Txt $n 'active') -eq 'false') { $c7direct++ } }
+        $upd  = Get-Num $n 'cumulateduptime_raw'; $sday = Get-Num $n 'statussince_raw_utc'
+        $ok = ($upd -ge $limitSec)
+        if (-not $ok -and $sday -gt 0) { $ok = ($epoch.AddDays($sday) -lt $cutoff) }   # 0＝無值，不是 1899
+        if ($ok) { $proven++ } else { $susp++; if ($sc -ne 7 -and $sc -ne 11) { $suspCounted++ } }
+    }
+    $total    = $nodes.Count
+    $code11   = if ($byCode.ContainsKey('11')) { [int]$byCode['11'] } else { 0 }
+    $licensed = $total - $c7 - $code11
+    Log "tree=$total code7=$c7 (direct $c7direct) code11=$code11 suspects=$susp"
+
+    # ---------- 2) 計量數 = 總數 −（狀態碼 7 ∪ 狀態碼 11 ∪ 建立未滿 N 小時）[owner 2026-10-27 指定] ----------
+    # 「建立未滿」只計沒被狀態碼 7／狀態碼 11 抓到的那些 → 聯集不會重複扣。
+    $licensed = $total - $c7 - $code11                       # 不做年齡扣除時的參考值
+    $newUnder = 0
+    if (-not $NoAgeCheck) { $newUnder = $suspCounted }
+    $metered  = $total - $c7 - $code11 - $newUnder
+
+    # ---------- 3) 上限：判準＝MaxSensorCount 能不能解析成數字 ----------
+    # 解析得到 → 這台能設定 sensor 數量上限；解析不到 → 上限未知（不猜，Freeware 的 100 也不自動套）。
+    # 換算：F／C 就是該值；S（訂閱制）÷ SubscriptionDivisor（預設 2）才是客戶實際訂閱的數量。
+    $edition = ''; $rawMax = 0; $maintDays = $null
+    try {
+        $st = Get-Json -Path 'getstatus.htm' -ExtraQuery 'id=0'
+        $edition = [string]$st.EditionType
+        $d = 0
+        if ([int]::TryParse([string]$st.MaxSensorCount, [ref]$d)) { $rawMax = $d }
+        if ([int]::TryParse([string]$st.MaintExpiryDays, [ref]$d)) { $maintDays = $d }
+    } catch { Log "getstatus unavailable: $($_.Exception.Message)" }
+    $ceilingOK = ($rawMax -gt 0)
+    $quota = 0; $quotaSrc = 'MaxSensorCount not readable -> ceiling unknown (pass -LicenseLimit)'
+    if ($LicenseLimit -gt 0) { $quota = $LicenseLimit; $quotaSrc = '-LicenseLimit' }
+    elseif ($ceilingOK) {
+        if ($edition -eq 'S') { $quota = [int][math]::Ceiling($rawMax / $SubscriptionDivisor); $quotaSrc = "MaxSensorCount $rawMax / $SubscriptionDivisor (subscription)" }
+        else                  { $quota = $rawMax; $quotaSrc = "MaxSensorCount $rawMax ($edition)" }
+    }
+    $quotaUnknown = ($quota -le 0)
+    $usage = 0.0
+    if (-not $quotaUnknown) { $usage = [math]::Round((100.0 * $metered / $quota), 1) }
+
+    # ---------- 4) 輸出 XML ----------
+    $parts = New-Object System.Collections.ArrayList
+    function Add-Channel {
+        param([string]$Name, $Value, [string]$Unit, [int]$Mode = 0, [int]$Float = 0, [int]$Warn = 0, [int]$Err = 0)
+        $s = '<result><channel>' + (Esc $Name) + '</channel><value>' + $Value + '</value>' +
+            '<unit>' + $Unit + '</unit><mode>' + $Mode + '</mode><float>' + $Float + '</float>'
+        # 限值元素名稱依 PRTG 版本有差異，所以預設**不輸出**（用 -Limits 開啟），建議改在
+        # 感測器的 Channel Limits 分頁設定，那裡永遠吃得對、也不會因為驗證失敗整個感測器 Down。
+        if ($Limits -and ($Warn -gt 0 -or $Err -gt 0)) {
+            if ($Warn -gt 0) { $s += '<limitmaxwarning>' + $Warn + '</limitmaxwarning>' }
+            if ($Err  -gt 0) { $s += '<limitmaxerror>'   + $Err  + '</limitmaxerror>'   }
+            $s += '<limitmode>1</limitmode>'
+        }
+        $s += '</result>'
+        [void]$parts.Add($s)
+    }
+    Add-Channel 'Licensed sensors'        $metered 'Count'
+    Add-Channel 'PRTG total sensors'      $total   'Count'
+    Add-Channel 'Paused (code 7)'         $c7      'Count'
+    Add-Channel 'Not licensed (code 11)'  $code11  'Count'
+    Add-Channel 'Created under age limit' $newUnder 'Count'
+    Add-Channel 'License quota'           $quota   'Count' 1
+    Add-Channel 'Ceiling readable'        $(if ($ceilingOK) { 1 } else { 0 }) 'Count' 1
+    $wQ = 0; $eQ = 0
+    if (-not $quotaUnknown) { $wQ = $WarnPercent; $eQ = $ErrorPercent }
+    Add-Channel 'Quota usage %' $usage 'Percent' 0 1 $wQ $eQ
+
+    $txt = 'metered={0} = total {1} -7:{2} -11:{3} new<{4}h:{5}' -f $metered, $total, $c7, $code11, [int]$AgeHours, $newUnder
+    $txt += (' | quota={0} ({1})' -f $quota, $quotaSrc)
+    $edName = @{ 'F' = 'Freeware'; 'C' = 'Commercial'; 'S' = 'Subscription' }[[string]$edition]
+    if ($edName) { $txt += (' edition={0}' -f $edName) }
+    if ($quotaUnknown) { $txt = 'CEILING UNKNOWN (MaxSensorCount not parseable and no -LicenseLimit) | ' + $txt }
+    if ($code11 -gt 0)   { $txt += (' | CODE 11: {0} sensors paused by license' -f $code11) }
+    if ($NoAgeCheck)     { $txt += ' | age rule skipped by -NoAgeCheck' }
+    if ($edition -eq 'S' -and -not $quotaUnknown) {
+        $txt += (' | subscription: overage billed retroactively, code 11 only at {0}' -f ($quota * $SubscriptionDivisor))
+    }
+    if ($maintDays -ne $null) { $txt += (' | maintenance expires in {0} days' -f $maintDays) }
+    [Console]::Out.WriteLine('<prtg>' + ($parts -join '') + '<text>' + (Esc $txt) + '</text></prtg>')
+    exit 0
+} catch {
+    $ex = $_.Exception
+    $m = if ($ex.Message) { $ex.Message } else { 'unknown error' }
+    if ($ex.InnerException) { $m += (' | ' + $ex.InnerException.Message) }
+    Fail ('prtg-license-sensor: ' + $m + ' | target ' + $logoff)
+}
