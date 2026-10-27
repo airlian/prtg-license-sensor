@@ -176,6 +176,11 @@ marks it Down **with the reason** — deliberate: a silently partial number is w
 * **API keys are not numeric**, and their character set is whatever PRTG decides — never validate them against a
   whitelist, or you will reject a perfectly good customer key. Reject only what cannot be a credential: whitespace,
   control characters, a stray BOM, or a body starting with `<`/`{`.
+* **Never set `ServerCertificateValidationCallback = { $true }` on Windows PowerShell 5.1.** It is a PowerShell
+  scriptblock, and .NET invokes it from a **non-PowerShell thread**, which needs a DefaultRunspace. Under PRTG
+  (and on some console hosts) there is none, so every HTTPS request dies with *"the underlying connection was
+  closed … no Runspace is available to run script on this thread"*. Use a compiled `ICertificatePolicy` via
+  `Add-Type` instead — that is what the script does now.
 * **HTTPS to `127.0.0.1`/`localhost` always shows a name-mismatched certificate** (it is issued for the server's own
   name) and is usually self-signed. Loopback is trusted automatically; a remote self-signed host needs
   `-AllowSelfSigned`.

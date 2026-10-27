@@ -154,6 +154,10 @@ PRTG 裡每一個**物件**（感測器、裝置、群組…）都帶一個**狀
   任何失敗都回 `<prtg><error>…</error></prtg>`。
 * **API 金鑰不是純數字**，字元集由 PRTG 決定 —— **絕不可用白名單驗證**，那會擋掉客戶完全正常的金鑰。
   只擋「不可能是金鑰」的東西：空白、控制字元、殘留 BOM、以 `<`／`{` 開頭（那是文件內容不是金鑰）。
+* **Windows PowerShell 5.1 上絕對不要用 `ServerCertificateValidationCallback = { $true }`。** 它是 PowerShell
+  scriptblock，而 .NET 是在**非 PowerShell 執行緒**上叫用它，那裡需要 DefaultRunspace；PRTG 跑腳本的環境就沒有，
+  於是每個 HTTPS 要求都死在「基礎連接已關閉 … 沒有 Runspace 可在這個執行緒中用來執行指令碼」。
+  要改用 `Add-Type` 編出來的 `ICertificatePolicy`（純 .NET，不需要 Runspace）——腳本現在就是這樣做。
 * **打 `127.0.0.1`／`localhost` 的 HTTPS 憑證一定名稱不符**（憑證簽的是伺服器自己的名稱），多數還自簽。
   腳本對本機自動信任；**打遠端**自簽站才需要明確加 `-AllowSelfSigned`。
 

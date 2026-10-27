@@ -109,9 +109,33 @@ $loopback   = ($Base -match '^https?://(127\.0\.0\.1|\[::1\]|localhost)(:|/|$)')
 $certBypass = ($loopback -or [bool]$AllowSelfSigned)
 $PSMajor    = [int]$PSVersionTable.PSVersion.Major
 if ($PSMajor -lt 6) {
-    [Net.ServicePointManager]::SecurityProtocol =
-        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    if ($certBypass) { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } }
+    # TLS 版本：優先交給作業系統決定（Windows 10/11 上含 TLS 1.2/1.3），失敗才回到 TLS 1.2。
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::SystemDefault }
+    catch { [Net.ServicePointManager]::SecurityProtocol =
+                [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 }
+    if ($certBypass) {
+        # ⚠ 絕對不要用 `[Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }`：
+        #   那是 PowerShell scriptblock，.NET 是在**非 PowerShell 執行緒**上叫用它，需要 DefaultRunspace。
+        #   PRTG 跑腳本的方式就沒有 → 整個 HTTPS 要求直接死在
+        #   「基礎連接已關閉 … 沒有 Runspace 可在這個執行緒中用來執行指令碼」。
+        #   改用 compiled 的 ICertificatePolicy（純 .NET，不需要任何 Runspace）。
+        if (-not ('PrtgTrustAllCertificate' -as [type])) {
+            try {
+                Add-Type -ErrorAction Stop -TypeDefinition @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class PrtgTrustAllCertificate : ICertificatePolicy {
+    public bool CheckValidationResult(ServicePoint srvPoint, X509Certificate certificate,
+                                      WebRequest request, int certificateProblem) { return true; }
+}
+"@
+            } catch {
+                Fail ('cannot install the TLS trust helper (Add-Type failed: {0}) - use a valid certificate, or run this sensor with PowerShell 7' -f $_.Exception.Message)
+            }
+        }
+        try { [Net.ServicePointManager]::CertificatePolicy = New-Object PrtgTrustAllCertificate }
+        catch { Fail 'cannot set ServicePointManager.CertificatePolicy - use a valid certificate instead' }
+    }
 }
 function Get-Json {
     param([string]$Path, [string]$ExtraQuery)
@@ -249,5 +273,9 @@ try {
     $ex = $_.Exception
     $m = if ($ex.Message) { $ex.Message } else { 'unknown error' }
     if ($ex.InnerException) { $m += (' | ' + $ex.InnerException.Message) }
+    # 5.1 上 TLS 沒談成會是這一類訊息（訊息內容跟 Windows 語系有關）→ 補一句可動的下一步
+    if ($m -match 'Runspace|基礎連接已關閉|underlying connection|SSL|TLS') {
+        $m += ' | hint: TLS failed on Windows PowerShell 5.1 - the trust helper is compiled by Add-Type (needs write access to %TEMP%); or set the Script type of this sensor to PowerShell 7'
+    }
     Fail ('prtg-license-sensor: ' + $m + ' | target ' + $logoff)
 }
