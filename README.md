@@ -180,7 +180,10 @@ marks it Down **with the reason** — deliberate: a silently partial number is w
   scriptblock, and .NET invokes it from a **non-PowerShell thread**, which needs a DefaultRunspace. Under PRTG
   (and on some console hosts) there is none, so every HTTPS request dies with *"the underlying connection was
   closed … no Runspace is available to run script on this thread"*. Use a compiled `ICertificatePolicy` via
-  `Add-Type` instead — that is what the script does now.
+  `Add-Type` instead — that is what the script does now. If *something else* in the process registered such a
+  callback (a line copied into `$PROFILE`, or a loaded module), it still breaks every HTTPS request in that
+  process, so the script clears that registration on startup. Testing from a console: `.\script.ps1` **loads your
+  profile**, `powershell -NoProfile -File .\script.ps1` does not.
 * **HTTPS to `127.0.0.1`/`localhost` always shows a name-mismatched certificate** (it is issued for the server's own
   name) and is usually self-signed. Loopback is trusted automatically; a remote self-signed host needs
   `-AllowSelfSigned`.

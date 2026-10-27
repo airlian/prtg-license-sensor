@@ -158,6 +158,9 @@ PRTG 裡每一個**物件**（感測器、裝置、群組…）都帶一個**狀
   scriptblock，而 .NET 是在**非 PowerShell 執行緒**上叫用它，那裡需要 DefaultRunspace；PRTG 跑腳本的環境就沒有，
   於是每個 HTTPS 要求都死在「基礎連接已關閉 … 沒有 Runspace 可在這個執行緒中用來執行指令碼」。
   要改用 `Add-Type` 編出來的 `ICertificatePolicy`（純 .NET，不需要 Runspace）——腳本現在就是這樣做。
+  如果是**別的東西**在本程序註冊了那種回呼（`$PROFILE` 裡貼過的一行、或某個載入的模組），它照樣會讓所有
+  HTTPS 要求失敗，所以腳本啟動時會先把那個註冊清掉。用控制台測試時注意：`.\script.ps1` **會載入 profile**，
+  `powershell -NoProfile -File .\script.ps1` 不會。
 * **打 `127.0.0.1`／`localhost` 的 HTTPS 憑證一定名稱不符**（憑證簽的是伺服器自己的名稱），多數還自簽。
   腳本對本機自動信任；**打遠端**自簽站才需要明確加 `-AllowSelfSigned`。
 

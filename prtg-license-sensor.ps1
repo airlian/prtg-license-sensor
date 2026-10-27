@@ -113,10 +113,17 @@ if ($PSMajor -lt 6) {
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::SystemDefault }
     catch { [Net.ServicePointManager]::SecurityProtocol =
                 [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 }
+    # 環境可能已經在本程序註冊了 scriptblock 版的憑證驗證回呼（常見的來源：$PROFILE 裡貼過的
+    # 「忽略自簽憑證」那一行、或某個載入的模組）。那種回呼在 .NET 的 TLS 執行緒上跑不起來
+    # （需要 DefaultRunspace），會讓這個程序的**任何** HTTPS 要求直接失敗。
+    # 所以我們一律先清掉它，再自己接管信任判定：嚴格驗證＝維持 $null（.NET 預設）；要信任全部就安裝編譯版政策。
+    if ($null -ne [Net.ServicePointManager]::ServerCertificateValidationCallback) {
+        Log 'environment already registered a certificate validation callback - clearing it (a PowerShell scriptblock cannot run on the .NET TLS thread)'
+        [Net.ServicePointManager]::ServerCertificateValidationCallback = $null
+    }
     if ($certBypass) {
-        # ⚠ 絕對不要用 `[Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }`：
-        #   那是 PowerShell scriptblock，.NET 是在**非 PowerShell 執行緒**上叫用它，需要 DefaultRunspace。
-        #   PRTG 跑腳本的方式就沒有 → 整個 HTTPS 要求直接死在
+        # ⚠ 絕對不要再把 PowerShell scriptblock 交給 .NET 的憑證回呼：.NET 是在**非 PowerShell 執行緒**
+        #   上叫用它，需要 DefaultRunspace；PRTG 跑腳本的方式就沒有 → 整個 HTTPS 要求直接死在
         #   「基礎連接已關閉 … 沒有 Runspace 可在這個執行緒中用來執行指令碼」。
         #   改用 compiled 的 ICertificatePolicy（純 .NET，不需要任何 Runspace）。
         if (-not ('PrtgTrustAllCertificate' -as [type])) {
