@@ -280,9 +280,6 @@ try {
     if ($quotaUnknown) { $txt = 'CEILING UNKNOWN (MaxSensorCount not parseable and no -LicenseLimit) | ' + $txt }
     if ($code11 -gt 0)   { $txt += (' | CODE 11: {0} sensors paused by license' -f $code11) }
     if ($NoAgeCheck)     { $txt += ' | age rule skipped by -NoAgeCheck' }
-    if ($edition -eq 'S' -and -not $quotaUnknown) {
-        $txt += (' | subscription: overage billed retroactively, code 11 only at {0}' -f ($quota * $SubscriptionDivisor))
-    }
     if ($maintDays -ne $null) { $txt += (' | maintenance expires in {0} days' -f $maintDays) }
     [Console]::Out.WriteLine('<prtg>' + ($parts -join '') + '<text>' + (Esc $txt) + '</text></prtg>')
     exit 0

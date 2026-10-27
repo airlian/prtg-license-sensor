@@ -166,12 +166,17 @@ PRTG 裡每一個**物件**（感測器、裝置、群組…）都帶一個**狀
 * 任何能讀裝置樹的憑證即可；只有額度與確切建立時間需要管理員。
 * **純唯讀**，不會對 PRTG 做任何寫入。
 
-**建感測器之前**，先在核心伺服器的控制台手動跑一次，確認 stdout **只有一份** `<prtg>` 文件
-（8 條 `<result>` 通道＋`<text>`）：
+**建感測器之前**，先到核心伺服器、在 `Custom Sensors\EXEXML` 資料夾裡手動跑一次：
 
 ```
-powershell -NoProfile -ExecutionPolicy Bypass -File .\prtg-license-sensor.ps1 -BaseUri http://127.0.0.1 -TokenFile C:\ProgramData\prtg-license\token.txt
+powershell -NoProfile -ExecutionPolicy Bypass -File .\prtg-license-sensor.ps1 -BaseUri https://127.0.0.1 -TokenFile C:\ProgramData\prtg-license\token.txt -LicenseLimit 100
 ```
+
+正常會輸出**恰好一份** `<prtg>` 文件：8 條 `<result>` 通道＋`<text>`。**失敗時也恰好是一份**
+`<prtg><error>原因</error></prtg>`，而且結束碼仍是 0；要看每一步就加 `-LogStderr`（寫到 stderr）。
+
+**控制台跑通不等於感測器會動**：PRTG 是用**探測器服務帳號**執行（該帳號要讀得到金鑰檔），而且只會透過
+`powershell.exe`／包裝檔叫用。所以「控制台成功、PRTG 收不到東西」請查步驟 2-3 的叫用方式與檔案權限，不是查公式。
 
 ## 授權
 

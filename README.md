@@ -186,12 +186,20 @@ marks it Down **with the reason** — deliberate: a silently partial number is w
   exact creation dates.
 * Read-only API. Nothing is written to PRTG.
 
-**Before creating the sensor**, run it once from a console on the core server and check that stdout is
-exactly one `<prtg>` document (8 `<result>` channels plus `<text>`):
+**Before creating the sensor**, run it once from a console, in the `Custom Sensors\EXEXML` folder:
 
 ```
-powershell -NoProfile -ExecutionPolicy Bypass -File .\prtg-license-sensor.ps1 -BaseUri http://127.0.0.1 -TokenFile C:\ProgramData\prtg-license\token.txt
+powershell -NoProfile -ExecutionPolicy Bypass -File .\prtg-license-sensor.ps1 -BaseUri https://127.0.0.1 -TokenFile C:\ProgramData\prtg-license\token.txt -LicenseLimit 100
 ```
+
+A good run prints exactly one `<prtg>` document — 8 `<result>` channels plus `<text>`. A failing run prints
+exactly one document too, `<prtg><error>reason</error></prtg>`, and the exit code is still 0; add
+`-LogStderr` for the per-step trace on stderr.
+
+Console success is **not** the same as sensor success: PRTG runs the script as the **probe service account**
+(that account must be able to read the credential file) and only via `powershell.exe` / a wrapper. So
+"works in the console, nothing collected in PRTG" points at the invocation in steps 2-3 or at file
+permissions, not at the formula.
 
 ## Licence
 
