@@ -109,10 +109,20 @@ $loopback   = ($Base -match '^https?://(127\.0\.0\.1|\[::1\]|localhost)(:|/|$)')
 $certBypass = ($loopback -or [bool]$AllowSelfSigned)
 $PSMajor    = [int]$PSVersionTable.PSVersion.Major
 if ($PSMajor -lt 6) {
-    # TLS 版本：優先交給作業系統決定（Windows 10/11 上含 TLS 1.2/1.3），失敗才回到 TLS 1.2。
-    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::SystemDefault }
-    catch { [Net.ServicePointManager]::SecurityProtocol =
-                [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 }
+    # TLS 協定：**明確指定一組乾淨的值**，不要覆寫成 SystemDefault、也不要用 -bor 補位。
+    #   * `SecurityProtocolType.SystemDefault` 在 .NET Framework 上是 -1（所有位元）；賦值當下不檢查，
+    #     交握時內部的 SslProtocolType 驗證才失敗 →「指定值在 'SslProtocolType' 列舉中是無效的
+    #     (sslProtocolType)」＋「基礎連接已關閉」。
+    #   * `-bor` 補位在同一台機器「現值就是 SystemDefault(-1)」時等於沒改（-1 -bor x 仍是 -1）。
+    #   所以要的是「直接換成 Tls12(+Tls11)」這種每位元都合法的組合。需要 TLS 1.3 請改用 PowerShell 7。
+    try {
+        $tlsPrev = [string][Net.ServicePointManager]::SecurityProtocol
+        $tls = [Net.SecurityProtocolType]::Tls12
+        if ([Enum]::IsDefined([Net.SecurityProtocolType], 'Tls11')) { $tls = $tls -bor [Net.SecurityProtocolType]::Tls11 }
+        [Net.ServicePointManager]::SecurityProtocol = $tls
+        Log ('TLS protocols: ' + $tlsPrev + ' -> ' + [Net.ServicePointManager]::SecurityProtocol)
+        Log ('.NET ' + [Environment]::Version + ' / OS build ' + [Environment]::OSVersion.Version.Build)
+    } catch { Log ('could not set the TLS protocol list, keeping the default: ' + $_.Exception.Message) }
     # 環境可能已經在本程序註冊了 scriptblock 版的憑證驗證回呼（常見的來源：$PROFILE 裡貼過的
     # 「忽略自簽憑證」那一行、或某個載入的模組）。那種回呼在 .NET 的 TLS 執行緒上跑不起來
     # （需要 DefaultRunspace），會讓這個程序的**任何** HTTPS 要求直接失敗。
