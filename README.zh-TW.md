@@ -59,29 +59,33 @@ PRTG 裡每一個**物件**（感測器、裝置、群組…）都帶一個**狀
 
 ## 在 PRTG 上建立感測器
 
-1. 把 `prtg-license-sensor.ps1` 放到**執行探測器那台機器**的 PRTG **程式安裝目錄**下、給「會回 XML/JSON 的腳本」的
-   資料夾 `Custom Sensors\EXEXML\`（一般為 `C:\Program Files (x86)\PRTG Network Monitor\Custom Sensors\EXEXML\`）。
-   原廠原文：會回 XML/JSON 的要用 EXE/Script Advanced，檔案放 `Custom Sensors\EXEXML`；`Custom Sensors\EXE`
-   是**標準版** EXE/Script 用的（它不解析 XML）。**是程式安裝目錄、不是 `ProgramData`**，也沒有 `excel\` 這種資料夾。
-   遠端探測器要放探測器那台、集群則每個節點都放；放好後類型清單會快取數十秒才看到新檔。
-2. **新增感測器** → 類型 **EXE/Script Advanced**。在 *EXE/Script* 欄清單裡選這支腳本（清單讀自
-   `Custom Sensors\EXEXML`，有快取延遲）；你的版本若可手動輸入，就填檔名。解譯器保持預設，
-   讓它走 `powershell.exe`（也就是 Windows PowerShell 5.1）。
-3. 要讓 PowerShell 真的跑得動這個檔：幫檔簽章，或放寬 PRTG 執行帳號的執行策略。原廠註記：
-   「**PowerShell 腳本要確保能被執行，必須簽章，或相對應地調整 Powershell.exe 的安全性原則**」。
-   在控制台可以用 `-ExecutionPolicy Bypass` 覆蓋，**但 PRTG 不會幫你加這個參數** ——
-   所以「控制台跑得到、感測器跑不到」是正常的，先從這裡查。
-4. **Parameters 只放路徑，絕對不要放金鑰** —— 參數會明文存在感測器設定裡，也會出現在 API 回應：
+1. 把 `prtg-license-sensor.ps1` 放到**執行探測器那台機器**的 `Custom Sensors\EXEXML\`（PRTG **程式安裝目錄**下，一般為
+   `C:\Program Files (x86)\PRTG Network Monitor\Custom Sensors\EXEXML\`）。遠端探測器要放探測器那台、集群則每個節點都
+   放；新檔要等數十秒才會出現在清單裡。
+2. **新增感測器** → 類型 **EXE/Script Advanced**。PRTG 不會自動叫 PowerShell，所以 *EXE/Script* 欄要指到步驟 3 的包裝檔，
+   或直接填直譯器：
    ```
-   -BaseUri http://127.0.0.1 -TokenFile "C:\ProgramData\prtg-license\token.txt" -LicenseLimit 500
+   EXE/Script:  prtg-license-sensor.bat
+   Parameters:  -BaseUri https://127.0.0.1 -TokenFile "C:\ProgramData\prtg-license\token.txt" -LicenseLimit 100
    ```
-   `-TokenFile` 內放一行 API 金鑰；`-PasshashFile` 內放一行 `username:passhash`。讀取刻意做得寬容：
-   UTF-8/UTF-16 BOM、CRLF、結尾空行、兩側引號、`#` 開頭的註解行都吃得下（這些正是記事本與 `Out-File` 的產物）。
-   真的無法使用時，訊息會指出第幾個字元是 `U+xxxx`，**不會印出金鑰內容**。
-   檔案權限縮到只有 PRTG 探測器服務帳號讀得到。
-5. 輪詢間隔（polling interval，感測器多久抓一次）設 300 秒就很夠用：數千顆的規模，
-   從本機打 API 大約 1~3 秒。
+   該欄填 `powershell.exe`／`pwsh.exe` 時，Parameters 要以
+   `-NoProfile -ExecutionPolicy Bypass -File prtg-license-sensor.ps1` 開頭；只選 `.ps1` 會什麼都收不到。
+   工作目錄就是 `Custom Sensors\EXEXML`，直接寫檔名即可。
+3. 包裝檔——重點只有 `%*`，沒有它參數不會傳進腳本：
+   ```bat
+   @echo off
+   powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0prtg-license-sensor.ps1" %*
+   ```
+4. **Parameters 只放路徑，絕對不要放金鑰**（會明文存在感測器設定與 API 回應裡）：
+   ```
+   -BaseUri http://127.0.0.1 -TokenFile "C:\ProgramData\prtg-license\token.txt" -LicenseLimit 100
+   ```
+   `-TokenFile` 內放一行 API 金鑰、`-PasshashFile` 內放一行 `username:passhash`；BOM、CRLF、兩側引號、`#` 註解行都吃得
+   下。檔案權限縮到只有 PRTG 探測器服務帳號讀得到。
+5. 輪詢間隔：300 秒就很夠用（數千顆對本機 API 大約 1~3 秒）。
 6. ⚠ **這個感測器本身也算 1 顆 sensor**，會進計量數。
+7. 都沒收到資料時：PRTG 把腳本原始輸出留在 `Result of Sensor <id>.txt`（設定裡 `resultfile` 那個名字，位置在
+   `Logs\Sensors\Custom\Results\`）。
 
 **看歷史**：對 `Licensed sensors`（或 `Quota usage %`）看 **近 24 小時的最大值**。原廠計費取的是
 「每天的最高值」，不是當下快照 —— 這正是把數字做成通道的好處。
@@ -143,26 +147,18 @@ PRTG 裡每一個**物件**（感測器、裝置、群組…）都帶一個**狀
 
 ## PRTG 的幾個坑
 
-* **憑證無效時回 `HTTP 200` + HTML `OK`，不是 401**。腳本要求「必須解析出含整數 `treesize` 的 JSON」，
-  只看狀態碼一定會誤判成功。
-* **`statussince_raw_utc = 0` 是「沒有值」**，不是 1899 年。
-* 數字用**點**當小數點 → 一律 `InvariantCulture` 解析，否則德文／法文 Windows 上會整批判錯。
-* Windows PowerShell 5.1 對 `text/xml` 的 `Invoke-WebRequest` 回的是 `XmlDocument`（PowerShell 7 回字串），
-  兩種都處理了。
-* **stdout 就是感測器協定**：不能用 `Write-Host`、進度列要關、除錯走 stderr、
-  通道名與 `<text>` 用 ASCII（5.1 主控台代碼頁會把中文變成亂碼進歷史），
-  任何失敗都回 `<prtg><error>…</error></prtg>`。
-* **API 金鑰不是純數字**，字元集由 PRTG 決定 —— **絕不可用白名單驗證**，那會擋掉客戶完全正常的金鑰。
-  只擋「不可能是金鑰」的東西：空白、控制字元、殘留 BOM、以 `<`／`{` 開頭（那是文件內容不是金鑰）。
-* **Windows PowerShell 5.1 上絕對不要用 `ServerCertificateValidationCallback = { $true }`。** 它是 PowerShell
-  scriptblock，而 .NET 是在**非 PowerShell 執行緒**上叫用它，那裡需要 DefaultRunspace；PRTG 跑腳本的環境就沒有，
-  於是每個 HTTPS 要求都死在「基礎連接已關閉 … 沒有 Runspace 可在這個執行緒中用來執行指令碼」。
-  要改用 `Add-Type` 編出來的 `ICertificatePolicy`（純 .NET，不需要 Runspace）——腳本現在就是這樣做。
-  如果是**別的東西**在本程序註冊了那種回呼（`$PROFILE` 裡貼過的一行、或某個載入的模組），它照樣會讓所有
-  HTTPS 要求失敗，所以腳本啟動時會先把那個註冊清掉。用控制台測試時注意：`.\script.ps1` **會載入 profile**，
-  `powershell -NoProfile -File .\script.ps1` 不會。
-* **打 `127.0.0.1`／`localhost` 的 HTTPS 憑證一定名稱不符**（憑證簽的是伺服器自己的名稱），多數還自簽。
-  腳本對本機自動信任；**打遠端**自簽站才需要明確加 `-AllowSelfSigned`。
+* 憑證無效可能回 `HTTP 200` ＋ HTML `OK`，**不是 401**。別只看狀態碼：腳本要求「可解析、且含整數 `treesize` 的 JSON」。
+* `statussince_raw_utc = 0` 是**沒有值**，不是 1899 年。
+* 數字用**點**當小數點 → 一律 `InvariantCulture` 解析，否則德文／法文 Windows 會整批判錯。
+* 5.1 對 `text/xml` 的 `Invoke-WebRequest` 回 `XmlDocument`（PowerShell 7 回字串），兩種都處理了。
+* **stdout 就是協定**：不能用 `Write-Host`、進度列要關、除錯走 stderr、通道名與 `<text>` 用 ASCII（5.1 主控台代碼頁會
+  把中文變成亂碼進歷史），任何失敗都回 `<prtg><error>…</error></prtg>`。
+* API 金鑰不是純數字、字元集由 PRTG 決定 —— 別用字元白名單驗證。只擋空白、控制字元、殘留 BOM、以 `<`／`{` 開頭者。
+* 打 `127.0.0.1`／`localhost` 的 HTTPS 憑證一定名稱不符（簽的是伺服器名稱）。本機自動信任；打**遠端**自簽站要加
+  `-AllowSelfSigned`。
+* 不要把 PowerShell scriptblock 交給 .NET 當憑證回呼——.NET 在沒有 PowerShell 執行環境的執行緒上叫用它。改用在
+  編譯期就完成的 `ICertificatePolicy`（本腳本的做法）。
+* 控制台測試：`.\script.ps1` 會載入 `$PROFILE`；`powershell -NoProfile -File .\script.ps1` 不會。
 
 ## 環境需求
 

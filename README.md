@@ -70,35 +70,34 @@ so **status code 11 being 0 is not evidence that you are within quota**.
 
 ## Install the sensor
 
-1. Copy `prtg-license-sensor.ps1` into `Custom Sensors\EXEXML\` under the **PRTG program directory**, on the
-   machine that runs the probe — typically
-   `C:\Program Files (x86)\PRTG Network Monitor\Custom Sensors\EXEXML\`.
-   Vendor wording: *"if your executable or script returns XML or JSON, you will use it with the EXE/Script
-   Advanced sensor… store your file into… `Custom Sensors\EXEXML`"*. `Custom Sensors\EXE` is for the **standard**
-   EXE/Script sensor, which does not parse XML. It is the *program* directory, **not** `ProgramData`.
-   Remote probe → copy it to the probe machine; cluster → every node. The type list is cached, so a new
-   file can take tens of seconds to show up.
-2. **Add Sensor** → type **EXE/Script Advanced**. In the *EXE/Script* field pick the script from the list
-   (it is read from `Custom Sensors\EXEXML`, after a short cache delay); if your PRTG version offers a
-   free-text option, type the file name. Leave the interpreter at the default so it runs through
-   `powershell.exe`, i.e. Windows PowerShell 5.1.
-3. Let PowerShell actually run the file: sign it, or relax the execution policy for the account PRTG runs as.
-   Vendor note: *"For PowerShell scripts, make sure that they can be executed by either signing the files or
-   changing the security policy for Powershell.exe accordingly."* From a console you override it per call with
-   `-ExecutionPolicy Bypass`, but PRTG does not — so a sensor that works in the console can still fail there.
-4. Parameters — **paths only, never the key** (parameters are stored in plain text and visible in the
-   sensor settings and API responses):
+1. Copy `prtg-license-sensor.ps1` to `Custom Sensors\EXEXML\` under the **PRTG program directory**, on the machine
+   that runs the probe — typically `C:\Program Files (x86)\PRTG Network Monitor\Custom Sensors\EXEXML\`. Remote
+   probe → copy it to the probe machine; cluster → every node. A new file can take tens of seconds to show up.
+2. **Add Sensor** → type **EXE/Script Advanced**. PRTG does not invoke PowerShell on its own, so point *EXE/Script*
+   at the wrapper from step 3, or at the interpreter directly:
    ```
-   -BaseUri http://127.0.0.1 -TokenFile "C:\ProgramData\prtg-license\token.txt" -LicenseLimit 500
+   EXE/Script:  prtg-license-sensor.bat
+   Parameters:  -BaseUri https://127.0.0.1 -TokenFile "C:\ProgramData\prtg-license\token.txt" -LicenseLimit 100
    ```
-   `-TokenFile` holds one line with the API key; `-PasshashFile` holds one line `username:passhash`. Reading them
-   is deliberately tolerant: a UTF-8/UTF-16 BOM, CRLF, a trailing blank line, surrounding quotes and `#` comment
-   lines are all accepted — those are exactly what Notepad and `Out-File` produce. When a value really is
-   unusable the message points at the offending character as `U+xxxx` and never prints the value.
-   Restrict the file so only the PRTG probe service account can read it.
-5. A polling interval (how often the sensor asks PRTG) of 300 s is plenty: a few thousand
-   objects cost roughly 1-3 s when the API is on localhost.
+   With `powershell.exe` / `pwsh.exe` in that field, Parameters must start with
+   `-NoProfile -ExecutionPolicy Bypass -File prtg-license-sensor.ps1`. A `.ps1` selected on its own collects
+   nothing. The working directory is `Custom Sensors\EXEXML`, so a bare file name resolves.
+3. Wrapper — the one part that matters is `%*`, without it the parameters never reach the script:
+   ```bat
+   @echo off
+   powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0prtg-license-sensor.ps1" %*
+   ```
+4. Parameters — **paths only, never the key** (they are stored in plain text and visible in the sensor settings
+   and API responses):
+   ```
+   -BaseUri http://127.0.0.1 -TokenFile "C:\ProgramData\prtg-license\token.txt" -LicenseLimit 100
+   ```
+   `-TokenFile` holds one line with the API key, `-PasshashFile` one line `username:passhash`; a BOM, CRLF,
+   surrounding quotes and `#` comment lines are tolerated. Restrict the file to the PRTG probe service account.
+5. Polling interval: 300 s is plenty (a few thousand objects cost roughly 1-3 s against localhost).
 6. ⚠ **This sensor is itself 1 sensor** and counts toward your licence.
+7. Collects nothing? PRTG keeps the raw script output in `Result of Sensor <id>.txt` (setting `resultfile`, under
+   `Logs\Sensors\Custom\Results\`).
 
 **Reading the history**: chart the **maximum over the last 24 h** of `Licensed sensors`
 (or `Quota usage %`). The vendor bills on the *highest value of the day*, not on a snapshot, and
@@ -163,30 +162,22 @@ marks it Down **with the reason** — deliberate: a silently partial number is w
 
 ## PRTG quirks worth knowing
 
-* **Invalid credentials return `HTTP 200` + HTML `OK`, not 401.** The script requires a parseable JSON
-  body with an integer `treesize`; never trust the status code alone.
-* **`statussince_raw_utc = 0` means "no value"**, not 1899.
-* Numbers come back with a **dot** decimal separator — parsed with `InvariantCulture`, otherwise a
-  German/French Windows host silently misjudges everything.
-* On Windows PowerShell 5.1 `Invoke-WebRequest` returns an `XmlDocument` for `text/xml`
-  (PowerShell 7 returns a string); both shapes are handled.
-* **stdout is the sensor protocol**: no `Write-Host`, progress records disabled, debug to stderr,
-  channel names and `<text>` in ASCII (5.1's console codepage would mangle them into history),
-  and every failure answers `<prtg><error>…</error></prtg>`.
-* **API keys are not numeric**, and their character set is whatever PRTG decides — never validate them against a
-  whitelist, or you will reject a perfectly good customer key. Reject only what cannot be a credential: whitespace,
-  control characters, a stray BOM, or a body starting with `<`/`{`.
-* **Never set `ServerCertificateValidationCallback = { $true }` on Windows PowerShell 5.1.** It is a PowerShell
-  scriptblock, and .NET invokes it from a **non-PowerShell thread**, which needs a DefaultRunspace. Under PRTG
-  (and on some console hosts) there is none, so every HTTPS request dies with *"the underlying connection was
-  closed … no Runspace is available to run script on this thread"*. Use a compiled `ICertificatePolicy` via
-  `Add-Type` instead — that is what the script does now. If *something else* in the process registered such a
-  callback (a line copied into `$PROFILE`, or a loaded module), it still breaks every HTTPS request in that
-  process, so the script clears that registration on startup. Testing from a console: `.\script.ps1` **loads your
-  profile**, `powershell -NoProfile -File .\script.ps1` does not.
-* **HTTPS to `127.0.0.1`/`localhost` always shows a name-mismatched certificate** (it is issued for the server's own
-  name) and is usually self-signed. Loopback is trusted automatically; a remote self-signed host needs
-  `-AllowSelfSigned`.
+* Invalid credentials can answer `HTTP 200` with HTML `OK`, not `401`. Never trust the status code alone: the
+  script requires parseable JSON containing an integer `treesize`.
+* `statussince_raw_utc = 0` means *no value*, not the year 1899.
+* Values use `.` as the decimal separator → parse with `InvariantCulture`, or a German/French host misreads them.
+* `Invoke-WebRequest` returns an `XmlDocument` for `text/xml` on Windows PowerShell 5.1 and a string on 7; both
+  are handled.
+* stdout **is** the protocol: no `Write-Host`, progress records off, debug to stderr, channel names and `<text>`
+  in ASCII (the 5.1 console codepage mangles anything else into the history), and every failure answers
+  `<prtg><error>…</error></prtg>`.
+* API keys are not numeric and their character set is whatever PRTG decides — do not validate them by character
+  class. Only whitespace, control characters, a stray BOM, or a body starting with `<`/`{` are rejected.
+* HTTPS to `127.0.0.1`/`localhost` always shows a name-mismatched certificate (issued for the server's own name).
+  Loopback is trusted automatically; a remote self-signed host needs `-AllowSelfSigned`.
+* Do not hand .NET a PowerShell scriptblock as a certificate callback — .NET calls it from a thread without a
+  PowerShell runspace. A compiled `ICertificatePolicy` is used instead.
+* From a console, `.\script.ps1` loads `$PROFILE`; `powershell -NoProfile -File .\script.ps1` does not.
 
 ## Requirements
 
