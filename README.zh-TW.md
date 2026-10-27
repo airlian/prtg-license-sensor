@@ -75,7 +75,9 @@ PRTG 裡每一個**物件**（感測器、裝置、群組…）都帶一個**狀
    ```
    -BaseUri http://127.0.0.1 -TokenFile "C:\ProgramData\prtg-license\token.txt" -LicenseLimit 500
    ```
-   `-TokenFile` 內放一行 API 金鑰；`-PasshashFile` 內放一行 `username:passhash`。
+   `-TokenFile` 內放一行 API 金鑰；`-PasshashFile` 內放一行 `username:passhash`。讀取刻意做得寬容：
+   UTF-8/UTF-16 BOM、CRLF、結尾空行、兩側引號、`#` 開頭的註解行都吃得下（這些正是記事本與 `Out-File` 的產物）。
+   真的無法使用時，訊息會指出第幾個字元是 `U+xxxx`，**不會印出金鑰內容**。
    檔案權限縮到只有 PRTG 探測器服務帳號讀得到。
 5. 輪詢間隔（polling interval，感測器多久抓一次）設 300 秒就很夠用：數千顆的規模，
    從本機打 API 大約 1~3 秒。
@@ -112,6 +114,7 @@ PRTG 裡每一個**物件**（感測器、裝置、群組…）都帶一個**狀
 | `-AgeHours` | `24` | 「建立滿 N 小時才計量」的門檻 |
 | `-NoAgeCheck` | 關 | 不扣這一項 |
 | `-TimeoutSec` | `30` | 對應感測器 Timeout |
+| `-AllowSelfSigned` | 關 | 接受自簽／名稱不符的 TLS 憑證。**本機位址自動信任**，這個開關是給**打遠端站台**用的 |
 | `-Limits` | 關 | 改由腳本輸出限值（見上） |
 | `-LogStderr` | 關 | 除錯訊息走 stderr（PRTG 不會顯示） |
 
@@ -149,7 +152,10 @@ PRTG 裡每一個**物件**（感測器、裝置、群組…）都帶一個**狀
 * **stdout 就是感測器協定**：不能用 `Write-Host`、進度列要關、除錯走 stderr、
   通道名與 `<text>` 用 ASCII（5.1 主控台代碼頁會把中文變成亂碼進歷史），
   任何失敗都回 `<prtg><error>…</error></prtg>`。
-* **API 金鑰不是純數字**，可能是很長、還含 `=` 的字串 —— 別用「純數字」去驗證它。
+* **API 金鑰不是純數字**，字元集由 PRTG 決定 —— **絕不可用白名單驗證**，那會擋掉客戶完全正常的金鑰。
+  只擋「不可能是金鑰」的東西：空白、控制字元、殘留 BOM、以 `<`／`{` 開頭（那是文件內容不是金鑰）。
+* **打 `127.0.0.1`／`localhost` 的 HTTPS 憑證一定名稱不符**（憑證簽的是伺服器自己的名稱），多數還自簽。
+  腳本對本機自動信任；**打遠端**自簽站才需要明確加 `-AllowSelfSigned`。
 
 ## 環境需求
 

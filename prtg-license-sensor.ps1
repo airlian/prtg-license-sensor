@@ -38,6 +38,7 @@ param(
     [int]    $ErrorPercent   = 100,
     [int]    $TimeoutSec     = 30,
     [switch] $NoAgeCheck,
+    [switch] $AllowSelfSigned,          # 非本機位趾的自簽／名稱不符憑證（本機 127.0.0.1 自動信任）
     [switch] $Limits,                   # 預設關：改在感測器的 Channel Limits 分頁設門檻（見下方說明）
     [switch] $LogStderr
 )
@@ -48,24 +49,64 @@ function Esc([string]$s) { [System.Security.SecurityElement]::Escape($s) }
 function Fail([string]$m) { [Console]::Out.WriteLine('<prtg><error>' + (Esc $m) + '</error></prtg>'); exit 0 }
 
 # ---------- 憑證 ----------
-if ($TokenFile -and (Test-Path $TokenFile)) { $ApiToken = (Get-Content $TokenFile -Raw).Trim() }
-if ($PasshashFile -and (Test-Path $PasshashFile)) {
-    $p = (Get-Content $PasshashFile -Raw).Trim(); $i = $p.IndexOf(':')
+# 金鑰檔的讀取要很寬容：BOM（UTF-8/UTF-16）、CRLF、尾部空行、手滑加的引號，
+# 都是客戶用記事本/PowerShell 存檔時常出現的東西，不該因此把正確的金鑰當成錯。
+function Clean-Secret([string]$s) {
+    if ([string]::IsNullOrEmpty($s)) { return '' }
+    $s = $s.Replace([string][char]0xFEFF, '')          # BOM / ZWNBSP（.NET Framework 的 Trim() 不把它當作空白）
+    $s = $s.Replace("`t", ' ').Trim()
+    if ($s.Length -ge 2) {
+        $f = $s.Substring(0,1); $l = $s.Substring($s.Length-1)
+        if (($f -eq '"' -and $l -eq '"') -or ($f -eq "'" -and $l -eq "'")) { $s = $s.Substring(1, $s.Length-2).Trim() }
+    }
+    return $s
+}
+# 驗證只擋「真的不可能對」的東西：空白／控制字元／非 ASCII（BOM 遺留），以及看起來根本是文件而非金鑰。
+# 金鑰字元集由 PRTG 決定，**不得用白名單去猜**（實測本站金鑰 48 碼、含 `=`）。
+function Test-Secret([string]$v, [string]$what) {
+    if ($v.Length -lt 8) { Fail ("{0} looks too short (length={1}) - check the file content" -f $what, $v.Length) }
+    if ($v -match '[\r\n]')  { Fail "$what contains a line break - the file must hold ONE line only" }
+    if ($v -match ' ')       { Fail "$what contains a space - remove quotes and spaces (do not wrap it in quotes)" }
+    if ($v -match '^[<{]')   { Fail "$what does not look like a credential - it starts with '<' or '{' (looks like an HTML/JSON body?)" }
+    $m = [regex]::Matches($v, '[^\x21-\x7E]')
+    if ($m.Count -gt 0) {
+        $c = [int][char]$m[0].Value
+        Fail ('{0} rejected: character #{1} is U+{2:X4} (non-printable/non-ASCII, usually a BOM or wrong file encoding). Value not shown.' -f $what, ($m[0].Index+1), $c)
+    }
+}
+function Read-SecretFile([string]$path, [string]$what) {
+    if (-not (Test-Path -LiteralPath $path)) { Fail "$what file not found: $path" }
+    $lines = @()
+    try { $lines = @(Get-Content -LiteralPath $path) }     # 不指定 -Encoding：BOM 自動判別 UTF-16/UTF-8
+    catch { Fail "Cannot read $what file: $path" }
+    foreach ($l in $lines) {
+        $t = Clean-Secret $l
+        if ($t -and -not $t.StartsWith('#')) { return $t }
+    }
+    Fail "$what file has no usable line: $path (expected one line with the credential, # lines are comments)"
+}
+if ($TokenFile)    { $ApiToken = Read-SecretFile $TokenFile 'TokenFile' }
+if ($PasshashFile) {
+    $p = Read-SecretFile $PasshashFile 'PasshashFile'
+    $i = $p.IndexOf(':')
     if ($i -lt 1) { Fail 'PasshashFile must contain one line: username:passhash' }
-    $Username = $p.Substring(0, $i); $Passhash = $p.Substring($i + 1)
+    $Username = Clean-Secret $p.Substring(0, $i); $Passhash = Clean-Secret $p.Substring($i + 1)
 }
 if ($BaseUri -match '/api$') { $BaseUri = $BaseUri -replace '/api$', '' }
 $Base = $BaseUri.TrimEnd('/')
-# ⚠ 實測：PRTG 的 API 金鑰**不是純數字**，本站是 48 碼、可含 `=`（base64 風格）。
-#   只擋明顯壞值（空白、引號、&、%佔位符），不要拿「純數字」這種錯誤假設去擋客戶的金鑰。
-if ($ApiToken -and $ApiToken -notmatch '^[A-Za-z0-9+=/_-]{8,}$') { Fail 'apitoken looks invalid (8+ chars of [A-Za-z0-9+=/_-], no spaces/quotes/&)' }
+$ApiToken = Clean-Secret $ApiToken; $Username = Clean-Secret $Username; $Passhash = Clean-Secret $Passhash
+if ($ApiToken)  { Test-Secret $ApiToken 'apitoken' }
+if ($Passhash -and $Passhash -notmatch '^\d+$') { Test-Secret $Passhash 'passhash' }   # passhash 是數字，但不硬擋
 if (-not $ApiToken -and -not ($Username -and $Passhash)) { Fail 'no credentials: use -TokenFile (preferred) or -ApiToken / -Username + -Passhash' }
 $auth = if ($ApiToken) { @{ apitoken = $ApiToken } } else { @{ username = $Username; passhash = $Passhash } }
 $aq   = ($auth.GetEnumerator() | ForEach-Object { '{0}={1}' -f $_.Key, [uri]::EscapeDataString($_.Value) }) -join '&'
 $logoff = ('{0}/api/?{1}' -f $Base, (($auth.Keys | ForEach-Object { "$_=***" }) -join '&'))
 
 # ---------- HTTP ----------
-$certBypass = ($Base -notmatch '^https?://(127\.0\.0\.1|localhost)(:|/|$)')
+# 本機（127.0.0.1/localhost）的 HTTPS 幾乎一定是自簽或名稱不符（憑證簽的是伺服器名稱），
+# 這是正常部署形態 → 本機自動信任；打遠端站台就要明確給 -AllowSelfSigned。
+$loopback   = ($Base -match '^https?://(127\.0\.0\.1|\[::1\]|localhost)(:|/|$)')
+$certBypass = ($loopback -or [bool]$AllowSelfSigned)
 $PSMajor    = [int]$PSVersionTable.PSVersion.Major
 if ($PSMajor -lt 6) {
     [Net.ServicePointManager]::SecurityProtocol =

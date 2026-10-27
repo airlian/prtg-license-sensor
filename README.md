@@ -91,7 +91,10 @@ so **status code 11 being 0 is not evidence that you are within quota**.
    ```
    -BaseUri http://127.0.0.1 -TokenFile "C:\ProgramData\prtg-license\token.txt" -LicenseLimit 500
    ```
-   `-TokenFile` holds one line with the API key; `-PasshashFile` holds one line `username:passhash`.
+   `-TokenFile` holds one line with the API key; `-PasshashFile` holds one line `username:passhash`. Reading them
+   is deliberately tolerant: a UTF-8/UTF-16 BOM, CRLF, a trailing blank line, surrounding quotes and `#` comment
+   lines are all accepted — those are exactly what Notepad and `Out-File` produce. When a value really is
+   unusable the message points at the offending character as `U+xxxx` and never prints the value.
    Restrict the file so only the PRTG probe service account can read it.
 5. A polling interval (how often the sensor asks PRTG) of 300 s is plenty: a few thousand
    objects cost roughly 1-3 s when the API is on localhost.
@@ -129,6 +132,7 @@ set the 80 % / 100 % thresholds on the sensor's **Channel Limits** tab instead, 
 | `-AgeHours` | `24` | "created at least N hours ago" threshold |
 | `-NoAgeCheck` | off | skip that deduction |
 | `-TimeoutSec` | `30` | maps to the sensor timeout |
+| `-AllowSelfSigned` | off | accept a self-signed / name-mismatched TLS certificate. **Loopback is trusted automatically** — this switch is for a *remote* host |
 | `-Limits` | off | emit channel limits from the script (see note above) |
 | `-LogStderr` | off | debug output on stderr (PRTG ignores stderr) |
 
@@ -169,7 +173,12 @@ marks it Down **with the reason** — deliberate: a silently partial number is w
 * **stdout is the sensor protocol**: no `Write-Host`, progress records disabled, debug to stderr,
   channel names and `<text>` in ASCII (5.1's console codepage would mangle them into history),
   and every failure answers `<prtg><error>…</error></prtg>`.
-* API keys are not numeric — they can be long strings containing `=`. Don't validate them as digits.
+* **API keys are not numeric**, and their character set is whatever PRTG decides — never validate them against a
+  whitelist, or you will reject a perfectly good customer key. Reject only what cannot be a credential: whitespace,
+  control characters, a stray BOM, or a body starting with `<`/`{`.
+* **HTTPS to `127.0.0.1`/`localhost` always shows a name-mismatched certificate** (it is issued for the server's own
+  name) and is usually self-signed. Loopback is trusted automatically; a remote self-signed host needs
+  `-AllowSelfSigned`.
 
 ## Requirements
 
