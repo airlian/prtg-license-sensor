@@ -343,7 +343,9 @@ try {
     Add-Channel 'Not licensed (code 11)'       $code11   'Count'
     Add-Channel 'Created under age limit'      $newUnder 'Count'
     Add-Channel 'License quota'                $quota    'Count' 1
-    Add-Channel 'Ceiling readable'             $(if ($ceilingOK) { 1 } else { 0 }) 'Count' 1
+    # Ceiling readable 這條通道拿掉了（owner 2026-10-27）：它只是 0/1 的重複資訊，
+    # 「讀不到上限」已經有兩個訊號 —— License quota=0 與 <text> 開頭的 CEILING UNKNOWN。
+    # $ceilingOK 仍然要算（額度換算與 <text> 都用它），只是不再輸出成通道。
     Add-Channel 'Quota usage %'                $usage    'Percent' 0 1
 
     $txt = 'metered={0} = total {1} -7:{2} -11:{3} new<{4}h:{5}' -f $metered, $total, $c7, $code11, [int]$AgeHours, $newUnder

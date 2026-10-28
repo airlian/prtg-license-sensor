@@ -115,8 +115,7 @@ that is exactly what turning this number into a channel buys you.
 | `Paused (code 7)` | objects in status 7 (`PausedbyUser`) |
 | `Not licensed (code 11)` | objects in status 11 (`PausedbyLicense`); above 0 means the ceiling was reached |
 | `Created under age limit` | objects deducted as "younger than N hours" |
-| `License quota` | quota (subscription already divided); `0` when unknown |
-| `Ceiling readable` | `1` = `MaxSensorCount` parsed, `0` = not readable |
+| `License quota` | quota (subscription already divided); **`0` means the ceiling could not be read** — `<text>` also starts with `CEILING UNKNOWN` in that case |
 | `Quota usage %` | metered ÷ quota |
 
 ### The water mark (channel limits)
@@ -237,7 +236,7 @@ marks it Down **with the reason** — deliberate: a silently partial number is w
 powershell -NoProfile -ExecutionPolicy Bypass -File .\prtg-license-sensor.ps1 -BaseUri https://127.0.0.1 -TokenFile C:\ProgramData\prtg-license\token.txt -LicenseLimit 100
 ```
 
-A good run prints exactly one `<prtg>` document — 9 `<result>` channels plus `<text>`. A failing run prints
+A good run prints exactly one `<prtg>` document — 8 `<result>` channels plus `<text>`. A failing run prints
 exactly one document too, `<prtg><error>reason</error></prtg>`, and the exit code is still 0; add
 `-LogStderr` for the per-step trace on stderr.
 

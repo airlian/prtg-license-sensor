@@ -100,8 +100,7 @@ PRTG 裡每一個**物件**（感測器、裝置、群組…）都帶一個**狀
 | `Paused (code 7)` | 狀態碼 7（已暫停）的數量 |
 | `Not licensed (code 11)` | 狀態碼 11（已超授權）的數量，`> 0` 就是已碰到上限 |
 | `Created under age limit` | 按「建立未滿 N 小時」扣掉的顆數 |
-| `License quota` | 額度（訂閱制已換算）；讀不到時為 0 |
-| `Ceiling readable` | `1`＝`MaxSensorCount` 解析到了、`0`＝讀不到 |
+| `License quota` | 額度（訂閱制已換算）；**0＝讀不到上限**，此時 `<text>` 也會以 `CEILING UNKNOWN` 開頭 |
 | `Quota usage %` | 計量數 ÷ 額度 |
 
 ### 水位（通道限值）
@@ -207,7 +206,7 @@ PRTG 裡每一個**物件**（感測器、裝置、群組…）都帶一個**狀
 powershell -NoProfile -ExecutionPolicy Bypass -File .\prtg-license-sensor.ps1 -BaseUri https://127.0.0.1 -TokenFile C:\ProgramData\prtg-license\token.txt -LicenseLimit 100
 ```
 
-正常會輸出**恰好一份** `<prtg>` 文件：9 條 `<result>` 通道＋`<text>`。**失敗時也恰好是一份**
+正常會輸出**恰好一份** `<prtg>` 文件：8 條 `<result>` 通道＋`<text>`。**失敗時也恰好是一份**
 `<prtg><error>原因</error></prtg>`，而且結束碼仍是 0；要看每一步就加 `-LogStderr`（寫到 stderr）。
 
 **控制台跑通不等於感測器會動**：PRTG 是用**探測器服務帳號**執行（該帳號要讀得到金鑰檔），而且只會透過
