@@ -77,7 +77,7 @@ so **status code 11 being 0 is not evidence that you are within quota**.
    at the wrapper from step 3, or at the interpreter directly:
    ```
    EXE/Script:  prtg-license-sensor.bat
-   Parameters:  -BaseUri https://127.0.0.1 -TokenFile "C:\ProgramData\prtg-license\token.txt" -LicenseLimit 100
+   Parameters:  -BaseUri https://127.0.0.1 -TokenFile "C:\ProgramData\prtg-license\token.txt" -LicenseLimit 100 -SensorId %sensorid
    ```
    With `powershell.exe` / `pwsh.exe` in that field, Parameters must start with
    `-NoProfile -ExecutionPolicy Bypass -File prtg-license-sensor.ps1`. A `.ps1` selected on its own collects
@@ -90,10 +90,12 @@ so **status code 11 being 0 is not evidence that you are within quota**.
 4. Parameters — **paths only, never the key** (they are stored in plain text and visible in the sensor settings
    and API responses):
    ```
-   -BaseUri http://127.0.0.1 -TokenFile "C:\ProgramData\prtg-license\token.txt" -LicenseLimit 100
+   -BaseUri http://127.0.0.1 -TokenFile "C:\ProgramData\prtg-license\token.txt" -LicenseLimit 100 -SensorId %sensorid
    ```
    `-TokenFile` holds one line with the API key, `-PasshashFile` one line `username:passhash`; a BOM, CRLF,
    surrounding quotes and `#` comment lines are tolerated. Restrict the file to the PRTG probe service account.
+   `%sensorid` is replaced by PRTG with this sensor's own id (documented placeholder). It is only needed for
+   the automatic water mark — leave it out and the script stays read-only, you set the limit yourself.
 5. Polling interval: 300 s is plenty (a few thousand objects cost roughly 1-3 s against localhost).
 6. ⚠ **This sensor is itself 1 sensor** and counts toward your licence.
 7. Collects nothing? PRTG keeps the raw script output in `Result of Sensor <id>.txt` (setting `resultfile`, under
@@ -107,7 +109,8 @@ that is exactly what turning this number into a channel buys you.
 
 | Channel | Meaning |
 |---|---|
-| `Licensed sensors` | ★ the metered count (formula above) |
+| `Licensed sensors` | ★ the metered count (formula above) — carries the water mark |
+| `Licensed sensors (incl. new)` | the same count **without** the "created under N hours" deduction, i.e. `total − code 7 − code 11`. Always ≥ the metered count, so it reaches the quota first: that is your 24-hour head start. Same water mark |
 | `PRTG total sensors` | all objects |
 | `Paused (code 7)` | objects in status 7 (`PausedbyUser`) |
 | `Not licensed (code 11)` | objects in status 11 (`PausedbyLicense`); above 0 means the ceiling was reached |
@@ -116,8 +119,47 @@ that is exactly what turning this number into a channel buys you.
 | `Ceiling readable` | `1` = `MaxSensorCount` parsed, `0` = not readable |
 | `Quota usage %` | metered ÷ quota |
 
-Channel limits are **not** emitted by default (the limit element names differ between PRTG versions);
-set the 80 % / 100 % thresholds on the sensor's **Channel Limits** tab instead, or pass `-Limits`.
+### The water mark (channel limits)
+
+Both count channels get an **upper error limit = quota**. There is deliberately **no warning limit**:
+filling the licence up to 100 % is not a problem, only going over it is.
+
+Two things the vendor documents drive the design:
+
+* exceeding an upper error limit sets the sensor to **Down** (and needs *limit mode* on). Here that is
+  the point: Down means "certainly over quota" and can drive a notification. The red line on the chart
+  and the state change are one and the same setting — PRTG has no "colour only, no state change".
+* limits returned in the sensor XML (`<LimitMaxError>`, `<LimitMode>`) are honoured **only on the first
+  scan**, when the channel is created; every later scan ignores them. So editing script parameters can
+  never move an existing channel's limit.
+
+What can move it afterwards is the object-manipulation API, and the docs fix the order — value first,
+then enable:
+
+```
+/api/setobjectproperty.htm?id=<sensor>&subtype=channel&subid=<channel>&name=limitmaxerror&value=<quota>
+/api/setobjectproperty.htm?id=<sensor>&subtype=channel&subid=<channel>&name=limitmode&value=1
+```
+
+So the script does it for you when it can:
+
+* **quota known** (an administrator's credential read `MaxSensorCount`, or you passed `-LicenseLimit`)
+  **and** `-SensorId` given → it looks the channel ids up (`content=channels`; they are *not* 0-based,
+  don't hard-code them), writes the limit only when it differs, **reads it back to confirm**, and
+  reports what it did in `<text>`. Nothing is written when the value already matches, so leaving this
+  on every interval is cheap and safe.
+* **quota unknown** → nothing is written, `<text>` starts with `CEILING UNKNOWN` and says
+  `limits: NOT SET`.
+* you would rather the script never write → `-NoLimits`, then set it on the sensor's **Channel Limits**
+  tab yourself (Upper Error Limit = quota, Limit mode = on).
+
+`-SensorId` comes free from PRTG: write `%sensorid` in the Parameters field — a documented placeholder
+for EXE/Script sensors. Writing needs a credential that may write (an administrator's
+`username:passhash`). A read-only credential does **not** fail silently: `<text>` reports
+`limits: NOT APPLIED (… read back "" (credential is probably read-only))`.
+
+If your PRTG turns red at *equal to* the limit rather than *above* it (the wording in the docs is
+"overrun"), pass `-LimitSlack 1`.
 
 ## Parameters
 
@@ -131,8 +173,11 @@ set the 80 % / 100 % thresholds on the sensor's **Channel Limits** tab instead, 
 | `-AgeHours` | `24` | "created at least N hours ago" threshold |
 | `-NoAgeCheck` | off | skip that deduction |
 | `-TimeoutSec` | `30` | maps to the sensor timeout |
+| `-SensorId` | `0` | put `%sensorid` here in PRTG's Parameters field — required for the script to apply the water mark to its own channels |
+| `-NoLimits` | off | never write channel settings; set the limit in the Channel Limits tab yourself |
+| `-LimitSlack` | `0` | widen the water mark by N before it turns red (use `1` if your PRTG lights up at *equal to* the limit) |
 | `-AllowSelfSigned` | off | accept a self-signed / name-mismatched TLS certificate. **Loopback is trusted automatically** — this switch is for a *remote* host |
-| `-Limits` | off | emit channel limits from the script (see note above) |
+| `-Limits`, `-WarnPercent`, `-ErrorPercent` | — | accepted but unused (limits are handled automatically now, and there are no warning limits); they exist so older Parameters fields keep working |
 | `-LogStderr` | off | debug output on stderr (PRTG ignores stderr) |
 
 ## How it reads PRTG (single request)
@@ -192,7 +237,7 @@ marks it Down **with the reason** — deliberate: a silently partial number is w
 powershell -NoProfile -ExecutionPolicy Bypass -File .\prtg-license-sensor.ps1 -BaseUri https://127.0.0.1 -TokenFile C:\ProgramData\prtg-license\token.txt -LicenseLimit 100
 ```
 
-A good run prints exactly one `<prtg>` document — 8 `<result>` channels plus `<text>`. A failing run prints
+A good run prints exactly one `<prtg>` document — 9 `<result>` channels plus `<text>`. A failing run prints
 exactly one document too, `<prtg><error>reason</error></prtg>`, and the exit code is still 0; add
 `-LogStderr` for the per-step trace on stderr.
 

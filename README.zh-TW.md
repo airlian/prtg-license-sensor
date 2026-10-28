@@ -94,7 +94,8 @@ PRTG 裡每一個**物件**（感測器、裝置、群組…）都帶一個**狀
 
 | 通道 | 意義 |
 |---|---|
-| `Licensed sensors` | ★ 計量數（上面的公式） |
+| `Licensed sensors` | ★ 計量數（上面的公式）——水位壓在這條 |
+| `Licensed sensors (incl. new)` | 同一個數但**不扣**「建立未滿 N 小時」那一項，也就是 `全部 − 碼 7 − 碼 11`。恆 ≧ 計量數，所以會先碰到額度 → 這就是你的 24 小時反應窗。水位相同 |
 | `PRTG total sensors` | 全部物件數 |
 | `Paused (code 7)` | 狀態碼 7（已暫停）的數量 |
 | `Not licensed (code 11)` | 狀態碼 11（已超授權）的數量，`> 0` 就是已碰到上限 |
@@ -103,8 +104,39 @@ PRTG 裡每一個**物件**（感測器、裝置、群組…）都帶一個**狀
 | `Ceiling readable` | `1`＝`MaxSensorCount` 解析到了、`0`＝讀不到 |
 | `Quota usage %` | 計量數 ÷ 額度 |
 
-腳本預設**不輸出**通道限值（限值元素名稱依 PRTG 版本有差異），請在感測器的 **Channel Limits**
-分頁設 80%／100% 門檻；一定要由腳本輸出再加 `-Limits`。
+### 水位（通道限值）
+
+兩條數量通道都設**上限錯誤＝額度**。刻意**不設警告上限**：用到滿不是問題，用超過才是。
+
+原廠文件有兩點決定了這裡的做法：
+
+* 逾「上限錯誤」會讓感測器變成 **Down**（而且要 limit mode 開啟）。這邊正是要這樣：Down ＝確定已超過額度，
+  可以拿去驅動通知。圖上的紅線與狀態改變是同一個設定，PRTG 沒有「只變顏色、不變狀態」的限值。
+* 腳本 XML 裡回傳的限值（`<LimitMaxError>`、`<LimitMode>`）**只在通道建立的那一次掃描**被採用，
+  之後每次掃描一律忽略。所以改參數永遠改不動既有通道的限值。
+
+事後改得動的是 Object Manipulation API，而且原檔規定順序：先設值、再啟用：
+
+```
+/api/setobjectproperty.htm?id=<感測器>&subtype=channel&subid=<通道>&name=limitmaxerror&value=<額度>
+/api/setobjectproperty.htm?id=<感測器>&subtype=channel&subid=<通道>&name=limitmode&value=1
+```
+
+所以腳本在能做的時候就幫你設定好：
+
+* **額度已知**（管理員憑證讀到 `MaxSensorCount`，或你給了 `-LicenseLimit`）**而且**有給 `-SensorId`
+  → 它會用 `content=channels` 查通道編號（**不是從 0 開始**，別寫死）、只在數值不同時寫入、
+  **寫完讀回來確認**，並在 `<text>` 寫明做了什麼。數值已正確就不寫任何東西，所以每個輪詢週期都跑
+  也不會浪費、也不會亂改。
+* **額度未知** → 不寫入，`<text>` 以 `CEILING UNKNOWN` 開頭並標示 `limits: NOT SET`。
+* 不希望腳本寫入 → 加 `-NoLimits`，然後自己在感測器的 **Channel Limits** 分頁設
+  （上限錯誤＝額度、Limit mode 開啟）。
+
+`-SensorId` 由 PRTG 免費提供：在參數欄寫 `%sensorid`（EXE/Script 感測器的官方佔位符）。寫入需要
+**可寫的憑證**（管理員的 `username:passhash`）。唯讀憑證不會悄悄假成功：`<text>` 會報
+`limits: NOT APPLIED (… read back "" (credential is probably read-only))`。
+
+若你的 PRTG 在「等於」限值就亮紅（原檔的用詞是 overrun＝超過），加 `-LimitSlack 1`。
 
 ## 參數
 
@@ -118,8 +150,11 @@ PRTG 裡每一個**物件**（感測器、裝置、群組…）都帶一個**狀
 | `-AgeHours` | `24` | 「建立滿 N 小時才計量」的門檻 |
 | `-NoAgeCheck` | 關 | 不扣這一項 |
 | `-TimeoutSec` | `30` | 對應感測器 Timeout |
+| `-SensorId` | `0` | 在 PRTG 的參數欄寫 `-SensorId %sensorid` —— 要自動把水位套到自己通道上才需要 |
+| `-NoLimits` | 關 | 永不寫通道設定；限值是自己在 Channel Limits 分頁設 |
+| `-LimitSlack` | `0` | 水位再加寬 N 個才紅（你的 PRTG 若是「等於」就紅，填 `1`） |
 | `-AllowSelfSigned` | 關 | 接受自簽／名稱不符的 TLS 憑證。**本機位址自動信任**，這個開關是給**打遠端站台**用的 |
-| `-Limits` | 關 | 改由腳本輸出限值（見上） |
+| `-Limits`、`-WarnPercent`、`-ErrorPercent` | — | 可以吃但已不用（限值現在自動處理，而且不設警告上限）；留著只是為了讓既有參數欄不會報錯 |
 | `-LogStderr` | 關 | 除錯訊息走 stderr（PRTG 不會顯示） |
 
 ## 只讀一次 PRTG
@@ -172,7 +207,7 @@ PRTG 裡每一個**物件**（感測器、裝置、群組…）都帶一個**狀
 powershell -NoProfile -ExecutionPolicy Bypass -File .\prtg-license-sensor.ps1 -BaseUri https://127.0.0.1 -TokenFile C:\ProgramData\prtg-license\token.txt -LicenseLimit 100
 ```
 
-正常會輸出**恰好一份** `<prtg>` 文件：8 條 `<result>` 通道＋`<text>`。**失敗時也恰好是一份**
+正常會輸出**恰好一份** `<prtg>` 文件：9 條 `<result>` 通道＋`<text>`。**失敗時也恰好是一份**
 `<prtg><error>原因</error></prtg>`，而且結束碼仍是 0；要看每一步就加 `-LogStderr`（寫到 stderr）。
 
 **控制台跑通不等於感測器會動**：PRTG 是用**探測器服務帳號**執行（該帳號要讀得到金鑰檔），而且只會透過

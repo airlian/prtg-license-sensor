@@ -34,12 +34,15 @@ param(
     [int]    $LicenseLimit   = 0,       # 實際額度；訂閱制填「顯示上限 ÷ 2」後的那個數
     [int]    $SubscriptionDivisor = 2,
     [double] $AgeHours       = 24,
-    [int]    $WarnPercent    = 80,
-    [int]    $ErrorPercent   = 100,
+    [int]    $LimitSlack      = 0,      # 水位再加寬 N 個才紅（PRTG 原文是 overrun＝超過；若你的版本「等於」就紅，設 1）
+    [int]    $SensorId        = 0,      # 參數欄打 %sensorid 就會傳進來；給了才能自動把水位寫進通道設定
+    [switch] $NoLimits,                 # 不要自動設限值（自己在 Channel Limits 分頁設）
+    [switch] $AllowSelfSigned,          # 非本機位址的自簽／名稱不符憑證（本機 127.0.0.1 自動信任）
+    [switch] $Limits,                   # 舊開關（限值現在自動處理）；保留只為讓舊參數不會報錯
     [int]    $TimeoutSec     = 30,
     [switch] $NoAgeCheck,
-    [switch] $AllowSelfSigned,          # 非本機位趾的自簽／名稱不符憑證（本機 127.0.0.1 自動信任）
-    [switch] $Limits,                   # 預設關：改在感測器的 Channel Limits 分頁設門檻（見下方說明）
+    [int]    $WarnPercent    = 80,      # 已不用（不設警告上限）。保留只為讓舊參數不會報錯
+    [int]    $ErrorPercent   = 100,     # 已不用（Quota usage % 不再設限值）。保留只為讓舊參數不會報錯
     [switch] $LogStderr
 )
 $ErrorActionPreference = 'Stop'
@@ -178,6 +181,60 @@ function Get-XmlDoc {
     if ($c -is [xml]) { return $c }                 # 5.1 對 text/xml 直接給 XmlDocument（7 給字串）
     $x = New-Object xml; $x.LoadXml([string]$c); return $x
 }
+function Invoke-ApiRaw {
+    param([string]$Path, [string]$Query)
+    $url = '{0}/api/{1}?{2}{3}{4}' -f $Base, $Path, $Query, $(if ($Query) { '&' } else { '' }), $aq
+    $p = @{ Uri = $url; TimeoutSec = $TimeoutSec; UseBasicParsing = $true }
+    if ($certBypass -and $PSMajor -ge 6) { $p['SkipCertificateCheck'] = $true }
+    try { $r = Invoke-WebRequest @p } catch {
+        $ex = $_.Exception
+        $why = if ($ex.Message) { $ex.Message } elseif ($ex.InnerException) { $ex.InnerException.Message } else { 'no message' }
+        throw "$Path : $why"
+    }
+    return [string]$r.Content
+}
+
+# 把「水位＝額度」寫進通道設定。**為什麼非得寫入不可**：原檔（Custom Sensors XML）對 LimitMaxError／LimitMode
+# 各自都寫了同一句 —— 只在「通道建立的那一次掃描」被採用，之後每次掃描一律忽略。所以事後改額度，
+# 光靠腳本輸出不會更新通道，只能 setobjectproperty.htm（或在 Channel Limits 分頁手動設）。
+# 原檔（Object Manipulation API）也規定順序：先設限值、再 limitmode=1。
+# ⚠ 這是**寫入**動作：需要可寫的憑證（管理員 username/passhash 最穩）。不給 -SensorId、或給 -NoLimits，就完全不寫。
+function Sync-ChannelLimits {
+    param([int]$Sid, [int]$Limit, [string[]]$Channels)
+    # 防呆：非 advance 函式對「不存在的參數名」不報錯，會靜默塞進 $args → 曾經因此迴圈跑空還回 ok。
+    if (-not $Channels -or $Channels.Count -eq 0) { throw 'Sync-ChannelLimits got no channel names' }
+    if ($Limit -le 0) { throw ('Sync-ChannelLimits got limit=' + $Limit + ' (must be > 0)') }
+    # 通道編號一定現查：實測這台上第一條是 2（不是 0），還有一條內建 Downtime=-4，寫死會設到別的通道。
+    $j = Get-Json -Path 'table.json' -ExtraQuery ('content=channels&id=' + $Sid + '&count=200&columns=objid,name')
+    $rows = @($j.channels)
+    if (-not $rows -or $rows.Count -eq 0) { throw ('sensor ' + $Sid + ' returned no channels (wrong -SensorId?)') }
+    $set = @(); $same = @(); $missing = @()
+    foreach ($n in $Channels) {
+        $row = @($rows | Where-Object { [string]$_.name -eq $n })[0]
+        if (-not $row) { $missing += $n; continue }
+        $cid = [int]$row.objid_raw
+        $q   = 'id=' + $Sid + '&subtype=channel&subid=' + $cid
+        $curV = ''; $b = Invoke-ApiRaw -Path 'getobjectproperty.htm' -Query ($q + '&name=limitmaxerror')
+        if ($b -match '<result>([^<]*)</result>') { $curV = $matches[1].Trim() }
+        $curM = ''; $b = Invoke-ApiRaw -Path 'getobjectproperty.htm' -Query ($q + '&name=limitmode')
+        if ($b -match '<result>([^<]*)</result>') { $curM = $matches[1].Trim() }
+        if ($curV -eq [string]$Limit -and $curM -eq '1') { $same += ('' + $n + '#' + $cid); continue }
+        Log ('writing limitmaxerror=' + $Limit + ' on ' + $n + '#' + $cid + ' (was ' + $(if ($curV) { $curV } else { 'unset' }) + ', limitmode ' + $(if ($curM) { $curM } else { 'unset' }) + ')')
+        $null = Invoke-ApiRaw -Path 'setobjectproperty.htm' -Query ($q + '&name=limitmaxerror&value=' + $Limit)
+        $null = Invoke-ApiRaw -Path 'setobjectproperty.htm' -Query ($q + '&name=limitmode&value=1')
+        # 寫完一定讀回來：唯讀憑證打 setobjectproperty 可能回 200 但根本沒寫進去
+        $b = Invoke-ApiRaw -Path 'getobjectproperty.htm' -Query ($q + '&name=limitmaxerror')
+        $now = ''; if ($b -match '<result>([^<]*)</result>') { $now = $matches[1].Trim() }
+        if ($now -ne [string]$Limit) {
+            throw ('wrote limitmaxerror=' + $Limit + ' on ' + $n + '#' + $cid + ' but read back "' + $now + '" (credential is probably read-only)')
+        }
+        $set += ('' + $n + '#' + $cid)
+    }
+    if ($missing.Count) { throw ('channel not found on sensor ' + $Sid + ': ' + ($missing -join ', ') + ' (wrong -SensorId?)') }
+    if ($set.Count) { return ('limits: upper error limit ' + $Limit + ' set on ' + ($set -join ', ')) }
+    return ('limits: ok, ' + $Limit + ' on ' + ($same -join ', '))
+}
+
 function Get-Num {                                   # PRTG 用「點」小數 → 必須 InvariantCulture
     param($Node, [string]$Name)
     if ($null -eq $Node) { return 0.0 }
@@ -246,32 +303,48 @@ try {
     $usage = 0.0
     if (-not $quotaUnknown) { $usage = [math]::Round((100.0 * $metered / $quota), 1) }
 
+    # ---------- 3.5) 把水位寫進通道設定（額度已知、給了 -SensorId、且沒給 -NoLimits 才做）----------
+    # 水位＝額度，只壓在兩條「數量」通道上；不設警告上限（用到滿不是錯）；Quota usage % 也不設限值。
+    $script:EmitLimits = (-not $NoLimits) -and (-not $quotaUnknown)
+    $errLimit = 0
+    if (-not $quotaUnknown) { $errLimit = $quota + $LimitSlack }
+    $limitNote = ''
+    if ($NoLimits)          { $limitNote = 'limits: skipped by -NoLimits (set them in Channel Limits)' }
+    elseif ($quotaUnknown)  { $limitNote = 'limits: NOT SET (quota unknown - use admin credentials or -LicenseLimit)' }
+    elseif ($SensorId -le 0){ $limitNote = 'limits: NOT APPLIED (add "-SensorId %sensorid" to the Parameters field)' }
+    else {
+        try { $limitNote = Sync-ChannelLimits -Sid $SensorId -Limit $errLimit -Channels @('Licensed sensors', 'Licensed sensors (incl. new)') }
+        catch { $limitNote = 'limits: NOT APPLIED (' + $_.Exception.Message + ')' }
+    }
+
     # ---------- 4) 輸出 XML ----------
     $parts = New-Object System.Collections.ArrayList
     function Add-Channel {
         param([string]$Name, $Value, [string]$Unit, [int]$Mode = 0, [int]$Float = 0, [int]$Warn = 0, [int]$Err = 0)
         $s = '<result><channel>' + (Esc $Name) + '</channel><value>' + $Value + '</value>' +
             '<unit>' + $Unit + '</unit><mode>' + $Mode + '</mode><float>' + $Float + '</float>'
-        # 限值元素名稱依 PRTG 版本有差異，所以預設**不輸出**（用 -Limits 開啟），建議改在
-        # 感測器的 Channel Limits 分頁設定，那裡永遠吃得對、也不會因為驗證失敗整個感測器 Down。
-        if ($Limits -and ($Warn -gt 0 -or $Err -gt 0)) {
-            if ($Warn -gt 0) { $s += '<limitmaxwarning>' + $Warn + '</limitmaxwarning>' }
-            if ($Err  -gt 0) { $s += '<limitmaxerror>'   + $Err  + '</limitmaxerror>'   }
-            $s += '<limitmode>1</limitmode>'
+        # 限值：原檔（Custom Sensors XML）明載 LimitMaxError／LimitMode「只在通道建立的那次掃描」被採用，
+        # 之後各次掃描一律忽略；而且逾上限會讓感測器 **Down**（不是只有圖上顏色）。事後改水位只能走
+        # setobjectproperty.htm（見 Sync-ChannelLimits）或在 Channel Limits 分頁手動設。
+        # 只設「上限錯誤」＝額度：用到滿不是錯，超過才是；不設警告上限 [owner 2026-10-27]。
+        if ($script:EmitLimits -and ($Warn -gt 0 -or $Err -gt 0)) {
+            if ($Warn -gt 0) { $s += '<LimitMaxWarning>' + $Warn + '</LimitMaxWarning>' }
+            if ($Err  -gt 0) { $s += '<LimitMaxError>'   + $Err  + '</LimitMaxError>'   }
+            $s += '<LimitMode>1</LimitMode>'
         }
         $s += '</result>'
         [void]$parts.Add($s)
     }
-    Add-Channel 'Licensed sensors'        $metered 'Count'
-    Add-Channel 'PRTG total sensors'      $total   'Count'
-    Add-Channel 'Paused (code 7)'         $c7      'Count'
-    Add-Channel 'Not licensed (code 11)'  $code11  'Count'
-    Add-Channel 'Created under age limit' $newUnder 'Count'
-    Add-Channel 'License quota'           $quota   'Count' 1
-    Add-Channel 'Ceiling readable'        $(if ($ceilingOK) { 1 } else { 0 }) 'Count' 1
-    $wQ = 0; $eQ = 0
-    if (-not $quotaUnknown) { $wQ = $WarnPercent; $eQ = $ErrorPercent }
-    Add-Channel 'Quota usage %' $usage 'Percent' 0 1 $wQ $eQ
+    # 兩條數量通道的水位（$errLimit）與 EmitLimits 在 3.5 節算好；這裡只負責輸出。
+    Add-Channel 'Licensed sensors'             $metered  'Count' 0 0 0 $errLimit
+    Add-Channel 'Licensed sensors (incl. new)' $licensed 'Count' 0 0 0 $errLimit
+    Add-Channel 'PRTG total sensors'           $total    'Count'
+    Add-Channel 'Paused (code 7)'              $c7       'Count'
+    Add-Channel 'Not licensed (code 11)'       $code11   'Count'
+    Add-Channel 'Created under age limit'      $newUnder 'Count'
+    Add-Channel 'License quota'                $quota    'Count' 1
+    Add-Channel 'Ceiling readable'             $(if ($ceilingOK) { 1 } else { 0 }) 'Count' 1
+    Add-Channel 'Quota usage %'                $usage    'Percent' 0 1
 
     $txt = 'metered={0} = total {1} -7:{2} -11:{3} new<{4}h:{5}' -f $metered, $total, $c7, $code11, [int]$AgeHours, $newUnder
     $txt += (' | quota={0} ({1})' -f $quota, $quotaSrc)
@@ -281,6 +354,7 @@ try {
     if ($code11 -gt 0)   { $txt += (' | CODE 11: {0} sensors paused by license' -f $code11) }
     if ($NoAgeCheck)     { $txt += ' | age rule skipped by -NoAgeCheck' }
     if ($maintDays -ne $null) { $txt += (' | maintenance expires in {0} days' -f $maintDays) }
+    if ($limitNote) { $txt += (' | ' + $limitNote) }
     [Console]::Out.WriteLine('<prtg>' + ($parts -join '') + '<text>' + (Esc $txt) + '</text></prtg>')
     exit 0
 } catch {
